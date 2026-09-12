@@ -9,6 +9,10 @@ import datetime as dt
 import json
 import math
 import os
+import re
+import secrets
+import tempfile
+from urllib.parse import urlparse
 from pathlib import Path
 import signal
 import sqlite3
@@ -21,6 +25,7 @@ START = 4
 END = 56521
 JOB = {"source": SOURCE, "destination": DESTINATION, "start": START, "end": END}
 STOP = False
+TRANSFER_MODE = "copy"
 
 
 class Halt(Exception):
@@ -123,10 +128,17 @@ class State:
                 for key, value in {"job": JOB, "last": last, "scan": last,
                                    "copied": restored.get("copied_messages", 0),
                                    "skipped": restored.get("skipped_ids", 0),
+                                   "mode": restored.get("transfer_mode", "copy"),
                                    "not_before": restored.get("not_before_epoch", 0)}.items():
                     self.set(key, value)
         elif self.get("job") != JOB:
             raise Halt("Database belongs to a different source/destination/range.")
+        columns = {r[1] for r in self.db.execute("PRAGMA table_info(operations)")}
+        if "transport" not in columns:
+            self.db.execute("ALTER TABLE operations ADD COLUMN transport TEXT DEFAULT 'copy'")
+        if "random_ids" not in columns:
+            self.db.execute("ALTER TABLE operations ADD COLUMN random_ids TEXT")
+        self.db.commit()
         self.mirror()
 
     def get(self, key, default=None):
@@ -147,6 +159,7 @@ class State:
             "remaining_ids": max(0, END - self.get("last")),
             "scanned_through_id": self.get("scan"),
             "copied_messages": self.get("copied"), "skipped_ids": self.get("skipped"),
+            "transfer_mode": self.get("mode", "copy"),
             "not_before_epoch": self.get("not_before", 0),
             "unresolved_operation": dict(pending) if pending else None,
         })
@@ -164,6 +177,7 @@ class State:
             "total_id_slots": END - START + 1, "last_processed_id": last,
             "remaining_id_slots": END - last, "copied_messages": self.get("copied"),
             "skipped_ids": self.get("skipped"), "scanned_through_id": self.get("scan"),
+            "transfer_mode": self.get("mode", "copy"),
             "remaining_scanned_by_kind": counts,
             "cooldown_remaining_seconds": max(0, math.ceil(self.get("not_before", 0) - time.time())),
             "unresolved_operation": dict(self.unresolved()) if self.unresolved() else None,
@@ -186,10 +200,10 @@ class State:
             self.set("last", through)
         self.mirror()
 
-    def prepare(self, ids, through):
+    def prepare(self, ids, through, transport="copy", random_ids=None):
         with self.db:
-            cur = self.db.execute("INSERT INTO operations(source_ids,through_id,state,created_at) VALUES (?,?,'sending',?)",
-                                  (json.dumps(ids), through, time.time()))
+            cur = self.db.execute("INSERT INTO operations(source_ids,through_id,state,created_at,transport,random_ids) VALUES (?,?,'sending',?,?,?)",
+                                  (json.dumps(ids), through, time.time(), transport, json.dumps(random_ids)))
         self.mirror()  # Pending send is durable before the HTTP request.
         return cur.lastrowid
 
@@ -256,6 +270,7 @@ class BotAPI:
 
     def preflight(self):
         me = self.call("getMe", {})
+        source_protected = False
         for chat_id in (SOURCE, DESTINATION):
             chat = self.call("getChat", {"chat_id": chat_id})
             member = self.call("getChatMember", {"chat_id": chat_id, "user_id": me["id"]})
@@ -264,11 +279,11 @@ class BotAPI:
             if member.get("status") not in ("administrator", "creator"):
                 raise Halt(f"Add the bot as administrator of channel {chat_id}.")
             if chat_id == SOURCE and chat.get("has_protected_content"):
-                raise Halt("Source has content protection enabled; copying is not attempted.")
+                source_protected = True
             if chat_id == DESTINATION and not member.get("can_post_messages", member.get("status") == "creator"):
                 raise Halt("Bot needs Post Messages permission in the destination.")
         log(f"Bot @{me.get('username')} verified in both channels.")
-        return me["id"]
+        return me["id"], source_protected
 
 
 class Rejected(Halt):
@@ -288,49 +303,32 @@ def classify(message):
     return "copy"
 
 
-async def scan(state, token, api_id, api_hash, bot_id, scan_delay):
-    from telethon import TelegramClient, errors, functions, types
-    client = TelegramClient(str(state.directory / "bot"), api_id, api_hash,
-                            flood_sleep_threshold=0, request_retries=0,
-                            connection_retries=3, raise_last_call_error=True)
-    try:
-        await client.start(bot_token=token)
-        me = await client.get_me()
-        if not me.bot or me.id != bot_id:
-            raise Halt("bot.session belongs to a different account. Use the correct bot session.")
-        # Telegram explicitly permits bots to use a zero access hash for uncached peers.
-        channel = types.InputChannel(3571991185, 0)
-        info = await client(functions.channels.GetChannelsRequest([channel]))
-        source = next((c for c in info.chats if c.id == 3571991185), None)
-        if source is None or isinstance(source, types.ChannelForbidden):
-            raise Halt("The bot cannot read the source channel.")
-        if getattr(source, "noforwards", False):
-            raise Halt("Source is protected; copying is not attempted.")
-        channel = types.InputChannel(source.id, getattr(source, "access_hash", 0) or 0)
-        while state.get("scan") < END and not STOP:
-            first = state.get("scan") + 1
-            last = min(END, first + 99)
-            result = await client(functions.channels.GetMessagesRequest(
-                channel, [types.InputMessageID(i) for i in range(first, last + 1)]))
-            if not hasattr(result, "messages"):
-                raise Halt("Unexpected metadata response; scan checkpoint was not advanced.")
-            by_id = {m.id: m for m in result.messages}
-            rows = []
-            for i in range(first, last + 1):
-                m = by_id.get(i)
-                group = getattr(m, "grouped_id", None)
-                rows.append((i, str(group) if group is not None else None, classify(m)))
-            state.record_scan(rows, last)
-            if last == END or (last - START + 1) % 1000 == 0:
-                log(f"Scanned through ID {last}; {END - last:,} IDs left to inspect.")
-            await asyncio.sleep(scan_delay)
-    except errors.FloodWaitError as e:
-        raise Limited(e.seconds) from None
-    except errors.RPCError as e:
-        # Only the type is logged, avoiding authentication/session details.
-        raise Halt(f"Metadata scan stopped: {type(e).__name__}. Check bot access and credentials.") from None
-    finally:
-        await client.disconnect()
+async def fetch_messages(client, channel, ids):
+    from telethon import functions, types
+    result = await client(functions.channels.GetMessagesRequest(
+        channel, [types.InputMessageID(i) for i in ids]))
+    if not hasattr(result, "messages"):
+        raise Halt("Unexpected metadata response; checkpoint was not advanced.")
+    return {m.id: m for m in result.messages}
+
+
+async def scan(state, client, channel, scan_delay):
+    while state.get("scan") < END and not STOP:
+        first = state.get("scan") + 1
+        last = min(END, first + 99)
+        by_id = await fetch_messages(client, channel, range(first, last + 1))
+        rows = []
+        for i in range(first, last + 1):
+            m = by_id.get(i)
+            group = getattr(m, "grouped_id", None)
+            kind = classify(m)
+            if kind == "protected" and TRANSFER_MODE == "upload":
+                kind = "copy"
+            rows.append((i, str(group) if group is not None else None, kind))
+        state.record_scan(rows, last)
+        if last == END or (last - START + 1) % 1000 == 0:
+            log(f"Scanned through ID {last}; {END - last:,} IDs left to inspect.")
+        await asyncio.sleep(scan_delay)
 
 
 def next_unit(state):
@@ -339,7 +337,7 @@ def next_unit(state):
     if row is None:
         raise Halt("Metadata is incomplete; run the scan before copying.")
     if row["kind"] != "copy":
-        later = state.db.execute("SELECT min(id) FROM messages WHERE id>? AND kind='copy'", (first,)).fetchone()[0]
+        later = state.db.execute("SELECT min(id) FROM messages WHERE id>? AND kind IN ('copy','protected')", (first,)).fetchone()[0]
         return [], (later - 1 if later else END)
     if row["group_id"] is None:
         return [first], first
@@ -424,24 +422,281 @@ def wait_until(deadline):
         time.sleep(min(1, max(0, deadline - time.time())))
 
 
+def parse_reference(value):
+    """Return (optional source channel, ID) without accepting topics or other hosts."""
+    value = str(value).strip()
+    if value.isdecimal() and int(value) > 0:
+        return None, int(value)
+    if value.startswith('t.me/'):
+        value = 'https://' + value
+    url = urlparse(value)
+    if url.scheme not in ('http', 'https') or url.netloc.lower() not in ('t.me', 'www.t.me', 'telegram.me'):
+        raise Halt('Enter a positive message ID or a Telegram message link.')
+    match = re.fullmatch(r'/c/(\d+)/(\d+)/?', url.path)
+    if match:
+        chat, msg = map(int, match.groups())
+        if chat > 0 and msg > 0:
+            return -(1_000_000_000_000 + chat), msg
+    match = re.fullmatch(r'/([A-Za-z][A-Za-z0-9_]{3,31})/(\d+)/?', url.path)
+    if match and int(match[2]) > 0:
+        return '@' + match[1], int(match[2])
+    raise Halt('Expected a channel message link such as https://t.me/c/3571991185/4 (topic links are not supported).')
+
+
+def read_saved_job(directory):
+    database = directory / 'progress.sqlite3'
+    if database.exists():
+        with sqlite3.connect(database.as_uri() + '?mode=ro', uri=True) as db:
+            try:
+                row = db.execute("SELECT value FROM settings WHERE key='job'").fetchone()
+            except sqlite3.OperationalError:
+                return None
+            if row:
+                return json.loads(row[0])
+    checkpoint = directory / 'msg.txt'
+    if checkpoint.exists():
+        try:
+            return json.loads(checkpoint.read_text()).get('job')
+        except (ValueError, AttributeError):
+            raise Halt('Invalid msg.txt; repair or restore the checkpoint before proceeding.') from None
+    return None
+
+
+def configure_job(args, api):
+    global SOURCE, DESTINATION, START, END, JOB
+    root = Path(args.state_dir or Path(__file__).resolve().parent / 'state').resolve()
+    directory = root
+    if not args.state_dir and (root / 'active_job.json').exists():
+        try:
+            directory = (root / json.loads((root / 'active_job.json').read_text())['directory']).resolve()
+        except (ValueError, KeyError, TypeError):
+            raise Halt('Invalid active_job.json; specify --state-dir explicitly.') from None
+        if not directory.is_relative_to(root):
+            raise Halt('Invalid active job directory.')
+    saved = read_saved_job(directory)
+    defaults = saved or JOB
+    administrative = args.status or args.resolve or args.resume
+    start_ref, end_ref = args.from_message, args.to_message
+    if not administrative and sys.stdin.isatty():
+        channel_number = -defaults['source'] - 1_000_000_000_000
+        if start_ref is None:
+            start_ref = input(f"First message link or ID [https://t.me/c/{channel_number}/{defaults['start']}]: ").strip() or str(defaults['start'])
+        if end_ref is None:
+            end_ref = input(f"Last message link or ID [https://t.me/c/{channel_number}/{defaults['end']}]: ").strip() or str(defaults['end'])
+    if (start_ref is None) != (end_ref is None):
+        raise Halt('Supply both --from and --to, or use the interactive prompts.')
+    if not administrative and start_ref is None:
+        raise Halt('No terminal input. Supply --from and --to, or use --resume for the saved job.')
+    a_chat, first = parse_reference(start_ref or defaults['start'])
+    b_chat, last = parse_reference(end_ref or defaults['end'])
+    def resolve_chat(chat):
+        if isinstance(chat, str):
+            return api.call('getChat', {'chat_id': chat})['id']
+        return chat
+    a_chat, b_chat = resolve_chat(a_chat), resolve_chat(b_chat)
+    if a_chat is not None and b_chat is not None and a_chat != b_chat:
+        raise Halt('The first and last links must belong to the same source channel.')
+    source = a_chat or b_chat or defaults['source']
+    destination = args.destination or defaults['destination']
+    if not first <= last <= 2_147_483_647:
+        raise Halt('The end ID must be at least the start ID and fit a Telegram message ID.')
+    if source == destination or source >= -1_000_000_000_000 or destination >= -1_000_000_000_000:
+        raise Halt('Use two different channel IDs (in -100... format).')
+    selected = dict(source=source, destination=destination, start=first, end=last)
+    if selected != saved and not args.state_dir:
+        key = f'{-source}_{-destination}_{first}_{last}'
+        directory = root / 'jobs' / key
+    SOURCE, DESTINATION, START, END, JOB = source, destination, first, last, selected
+    directory.mkdir(parents=True, exist_ok=True)
+    # Administrative reads don't change which interactive job is active.
+    if not args.state_dir and not args.status and not args.resolve:
+        root.mkdir(parents=True, exist_ok=True)
+        atomic_json(root / 'active_job.json', {'directory': str(directory.relative_to(root))})
+    return directory
+
+
+def enable_upload(state, requested, reason):
+    global TRANSFER_MODE
+    if requested == 'copy':
+        raise Halt(f'{reason} Run with --mode upload to download and upload instead.')
+    if requested != 'upload' and state.get('mode') != 'upload':
+        if not sys.stdin.isatty():
+            raise Halt(f'{reason} Use --mode upload to select the download/upload fallback.')
+        answer = input(f'{reason}\nDownload and upload this range instead? [Y/n]: ').strip().lower()
+        if answer not in ('', 'y', 'yes'):
+            raise Halt('Transfer cancelled; progress retained.')
+    TRANSFER_MODE = 'upload'
+    with state.db:
+        state.set('mode', 'upload')
+        state.db.execute("UPDATE messages SET kind='copy' WHERE id>? AND kind='protected'", (state.get('last'),))
+    state.mirror()
+    log('Download/upload mode enabled. Albums and available original thumbnails will be carried over.')
+
+
+async def send_upload_unit(state, client, source, destination, ids, through, seconds):
+    from telethon import errors
+    import media_upload as upload
+    by_id = await fetch_messages(client, source, ids)
+    messages = []
+    for source_id in ids:
+        message = by_id.get(source_id)
+        if classify(message) in ('missing', 'service'):
+            # Refresh disappeared entries and re-plan before posting anything.
+            with state.db:
+                state.db.execute('UPDATE messages SET kind=?,group_id=NULL WHERE id=?', (classify(message), source_id))
+            state.mirror()
+        else:
+            messages.append(message)
+    if len(messages) != len(ids):
+        log('Source changed after scan; missing entries refreshed. Replanning the next unit.')
+        return
+    upload.validate_album(messages)
+    temp_root = state.directory / 'transfers'
+    temp_root.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='unit-', dir=temp_root) as temp:
+        upload.check_space(messages, temp)
+        stager = upload.Stager(client, destination, temp, log, stopped=lambda: STOP)
+        staged = [await stager.stage(message) for message in messages]
+        stager.check_stop()
+        random_ids = [secrets.randbits(63) or 1 for _ in ids]
+        request = upload.build_request(destination, messages, staged, random_ids)
+        seq = state.prepare(ids, through, transport='upload', random_ids=random_ids)
+        try:
+            result = await client(request)
+            dest = upload.extract_ids(result, random_ids)
+        except errors.FloodWaitError as e:
+            state.cooldown(e.seconds, padding=5)
+            state.mark(seq, 'rejected', 'Upload send was rate limited; no progress advanced.')
+            raise Limited(e.seconds) from None
+        except errors.RPCError as e:
+            # A rejected 4xx RPC doesn't imply successful delivery. Server failures may.
+            state.mark(seq, 'rejected' if 400 <= e.code < 500 else 'uncertain', type(e).__name__)
+            raise Halt(f'Upload send stopped: {type(e).__name__}. Progress was not advanced.') from None
+        except Exception as e:
+            state.mark(seq, 'uncertain', f'Upload outcome must be reviewed ({type(e).__name__}).')
+            raise Halt('Upload response was interrupted or incomplete. Inspect --status before resolving the send.') from None
+        state.cooldown(seconds * len(dest))
+        state.finish(seq, dest, 'Upload confirmed with MTProto random-ID mapping.')
+        log(f'Uploaded {len(dest)} message(s), through ID {through}; {END - through:,} ID slots left.')
+
+
+def create_client(api_id, api_hash):
+    from telethon import TelegramClient
+    from telethon.sessions import MemorySession
+    class TransferClient(TelegramClient):
+        # Telethon 1.45's normal login calls GetDifference even when update
+        # delivery is disabled. This finite job must not consume that stream.
+        # These two version-pinned hooks suppress synchronization and dispatch;
+        # authorization itself still uses Telethon's normal bot sign-in.
+        async def _on_login(self, user):
+            self._mb_entity_cache.set_self_user(user.id, user.bot, user.access_hash)
+            self._authorized = True
+            return user
+
+        async def _update_loop(self):
+            return
+
+    # A fresh authorization key per run prevents accidental key sharing across hosts.
+    # No update stream, polling, catch-up, webhook changes or bot command handlers.
+    return TransferClient(MemorySession(), api_id, api_hash, receive_updates=False, catch_up=False,
+                          flood_sleep_threshold=0, request_retries=0, connection_retries=3,
+                          raise_last_call_error=True)
+
+
+async def transfer(state, api, token, api_id, api_hash, bot_id, args):
+    from telethon import errors, functions, types
+    import media_upload as upload
+    client = create_client(api_id, api_hash)
+    try:
+        await client.start(bot_token=token)
+        me = await client.get_me()
+        if not me.bot or me.id != bot_id:
+            raise Halt('Telegram authorization does not match BOT_TOKEN.')
+        channel_number = -SOURCE - 1_000_000_000_000
+        dest_number = -DESTINATION - 1_000_000_000_000
+        info = await client(functions.channels.GetChannelsRequest([
+            types.InputChannel(channel_number, 0), types.InputChannel(dest_number, 0)]))
+        entities = {chat.id: chat for chat in info.chats}
+        source, destination = entities.get(channel_number), entities.get(dest_number)
+        if source is None or destination is None or any(isinstance(c, types.ChannelForbidden) for c in (source, destination)):
+            raise Halt('The bot cannot access both channels.')
+        if getattr(source, 'noforwards', False) and TRANSFER_MODE != 'upload':
+            enable_upload(state, args.mode, 'Source has content protection enabled.')
+        source = types.InputChannel(channel_number, getattr(source, 'access_hash', 0) or 0)
+        destination = types.InputPeerChannel(dest_number, getattr(destination, 'access_hash', 0) or 0)
+        if state.get('scan') < END:
+            log('Scanning message IDs and album membership before transfer.')
+            await scan(state, client, source, args.scan_delay)
+        state.status(args.seconds_per_message)
+        if args.scan_only or STOP:
+            return
+        if TRANSFER_MODE != 'upload' and state.db.execute("SELECT 1 FROM messages WHERE id>? AND kind='protected' LIMIT 1", (state.get('last'),)).fetchone():
+            enable_upload(state, args.mode, 'The selected range contains protected messages.')
+        if state.get('copied') == 0 and not state.db.execute("SELECT 1 FROM messages WHERE kind IN ('copy','protected') AND id>? LIMIT 1", (state.get('last'),)).fetchone():
+            raise Halt('No transferable messages found. Check the range and source access.')
+        while state.get('last') < END and not STOP:
+            first = state.db.execute('SELECT kind FROM messages WHERE id=?', (state.get('last') + 1,)).fetchone()
+            if first and first[0] == 'protected':
+                enable_upload(state, args.mode, 'This source message has content protection enabled.')
+            ids, through = next_unit(state)
+            if not ids:
+                log(f'Skipping missing/service IDs through {through}.')
+                state.skip(through)
+                continue
+            if TRANSFER_MODE == 'upload':
+                await send_upload_unit(state, client, source, destination, ids, through, args.seconds_per_message)
+            else:
+                try:
+                    send_unit(state, api, ids, through, args.seconds_per_message)
+                except Rejected as e:
+                    if e.code == 400 and any(term in str(e).lower() for term in ('protected', 'forwards_restricted')):
+                        enable_upload(state, args.mode, 'Telegram rejected copying because of content protection.')
+                        continue
+                    raise
+            while time.time() < state.get('not_before') and not STOP:
+                await asyncio.sleep(min(1, max(0, state.get('not_before') - time.time())))
+        log('Stopped with progress saved.' if STOP else 'Range complete.')
+        state.status(args.seconds_per_message)
+    except errors.FloodWaitError as e:
+        raise Limited(e.seconds) from None
+    except upload.UploadStopped as e:
+        log(str(e))
+    except upload.UploadProblem as e:
+        raise Halt(str(e)) from None
+    except errors.RPCError as e:
+        raise Halt(f'Telegram stopped the transfer: {type(e).__name__}. Current progress retained.') from None
+    finally:
+        await client.disconnect()
+
+
 def main():
+    global TRANSFER_MODE
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--state-dir", default=str(Path(__file__).resolve().parent / "state"))
-    parser.add_argument("--status", action="store_true", help="Show local progress without Telegram calls")
-    parser.add_argument("--scan-only", action="store_true", help="Inspect source metadata without copying")
-    parser.add_argument("--seconds-per-message", type=float, default=3.0)
-    parser.add_argument("--scan-delay", type=float, default=1.0)
-    parser.add_argument("--resolve", choices=("retry", "done", "accept-partial"))
-    parser.add_argument("--destination-ids", default="")
+    parser.add_argument('--state-dir', default=None, help='Explicit state directory; otherwise remember the selected job')
+    parser.add_argument('--from', dest='from_message', help='First source message link or numeric ID')
+    parser.add_argument('--to', dest='to_message', help='Last source message link or numeric ID (inclusive)')
+    parser.add_argument('--destination', type=int, help='Destination channel ID; defaults to the saved job')
+    parser.add_argument('--resume', action='store_true', help='Resume the selected job without range prompts')
+    parser.add_argument('--mode', choices=('ask', 'copy', 'upload'), default='ask')
+    parser.add_argument('--status', action='store_true', help='Show local progress without Telegram calls')
+    parser.add_argument('--scan-only', action='store_true', help='Inspect source metadata without posting')
+    parser.add_argument('--seconds-per-message', type=float, default=3.0)
+    parser.add_argument('--scan-delay', type=float, default=1.0)
+    parser.add_argument('--resolve', choices=('retry', 'done', 'accept-partial'))
+    parser.add_argument('--destination-ids', default='')
     args = parser.parse_args()
     if not math.isfinite(args.seconds_per_message) or args.seconds_per_message < 1.1:
-        parser.error("--seconds-per-message must be at least 1.1 (3.0 recommended)")
+        parser.error('--seconds-per-message must be at least 1.1 (3.0 recommended)')
     if not math.isfinite(args.scan_delay) or args.scan_delay < 0.5:
-        parser.error("--scan-delay must be at least 0.5")
+        parser.error('--scan-delay must be at least 0.5')
+    if (args.status or args.resolve or args.resume) and (args.from_message or args.to_message):
+        parser.error('--status, --resolve and --resume use the saved range; omit --from/--to')
     os.umask(0o077)
-    directory = Path(args.state_dir).resolve()
-    directory.mkdir(parents=True, exist_ok=True)
-    if args.status and (directory / "progress.sqlite3").exists():
+    load_env(Path(__file__).resolve().parent / '.env')
+    token = os.environ.get('BOT_TOKEN', '').strip()
+    api = BotAPI(token)  # Local construction only; prompts happen before network calls.
+    directory = configure_job(args, api)
+    if args.status and (directory / 'progress.sqlite3').exists():
         state = State(directory, readonly=True)
         try:
             state.status(args.seconds_per_message)
@@ -450,7 +705,7 @@ def main():
         return 0
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, stop_signal)
-    with exclusive_lock(directory / "copier.lock"):
+    with exclusive_lock(directory / 'copier.lock'):
         state = State(directory)
         try:
             if args.status:
@@ -461,61 +716,51 @@ def main():
                 return 0
             if state.unresolved():
                 state.status(args.seconds_per_message)
-                raise Halt("Unresolved send found. Inspect the destination before using --resolve.")
-            if state.get("last") >= END:
-                log("Range complete.")
+                raise Halt('Unresolved send found. Inspect the destination before using --resolve.')
+            if state.get('last') >= END:
+                log('Range complete.')
                 state.status(args.seconds_per_message)
                 return 0
-            remaining = math.ceil(state.get("not_before", 0) - time.time())
+            remaining = math.ceil(state.get('not_before', 0) - time.time())
             if remaining > 0:
-                raise Halt(f"Saved cooldown is active for {remaining}s; restart after it expires.")
-            load_env(Path(__file__).resolve().parent / ".env")
-            token = os.environ.get("BOT_TOKEN", "").strip()
-            if not token or ":" not in token:
-                raise Halt("Set BOT_TOKEN in .env.")
-            api = BotAPI(token)
+                raise Halt(f'Saved cooldown active for {remaining}s; restart after it expires.')
+            if not token or ':' not in token:
+                raise Halt('Set BOT_TOKEN in .env.')
             try:
-                bot_id = api.preflight()
-                if state.get("scan") < END:
-                    try:
-                        api_id = int(os.environ.get("API_ID", "0"))
-                    except ValueError:
-                        api_id = 0
-                    api_hash = os.environ.get("API_HASH", "").strip()
-                    if api_id <= 0 or not api_hash:
-                        raise Halt("Set API_ID and API_HASH in .env for album metadata scanning.")
-                    log("Scanning IDs to identify complete albums, missing entries and service messages.")
-                    asyncio.run(scan(state, token, api_id, api_hash, bot_id, args.scan_delay))
-                state.status(args.seconds_per_message)
-                if args.scan_only or STOP:
-                    return 0
-                if state.get("copied") == 0 and not state.db.execute("SELECT 1 FROM messages WHERE kind='copy' AND id>? LIMIT 1", (state.get("last"),)).fetchone():
-                    raise Halt("No copyable messages found. Verify access before accepting an empty source range.")
-                while state.get("last") < END and not STOP:
-                    ids, through = next_unit(state)
-                    if not ids:
-                        log(f"Skipping absent/service/protected IDs through {through}.")
-                        state.skip(through)
-                        continue
-                    send_unit(state, api, ids, through, args.seconds_per_message)
-                    wait_until(state.get("not_before"))
-                log("Stopped with progress saved." if STOP else "Range complete.")
-                state.status(args.seconds_per_message)
+                api_id = int(os.environ.get('API_ID', '0'))
+            except ValueError:
+                api_id = 0
+            api_hash = os.environ.get('API_HASH', '').strip()
+            if api_id <= 0 or not api_hash:
+                raise Halt('Set API_ID and API_HASH in .env for Telegram metadata and uploads.')
+            try:
+                bot_id, protected = api.preflight()
+                TRANSFER_MODE = 'copy'
+                if args.mode == 'upload' or (args.mode == 'ask' and state.get('mode') == 'upload') or protected:
+                    enable_upload(state, args.mode, 'Source has content protection enabled.' if protected else 'Upload mode selected.')
+                else:
+                    with state.db:
+                        state.set('mode', 'copy')
+                log(f'Source {SOURCE} → destination {DESTINATION}; IDs {START}..{END}. State: {directory}')
+                asyncio.run(transfer(state, api, token, api_id, api_hash, bot_id, args))
                 return 0
             except Limited as e:
                 state.cooldown(e.seconds, padding=5)
-                raise Halt(f"{e} Stopped. Cooldown saved; restart later.") from None
+                raise Halt(f'{e} Stopped. Cooldown saved; restart later.') from None
         finally:
             state.db.close()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     try:
         sys.exit(main())
+    except (EOFError, KeyboardInterrupt):
+        log('Cancelled. Saved progress was retained.')
+        sys.exit(2)
     except Halt as e:
         log(str(e))
         sys.exit(2)
     except Exception as e:
-        # No URLs, tokens, request dumps or full session tracebacks in logs.
-        log(f"Stopped on {type(e).__name__}. Progress retained. Use --status to inspect pending sends.")
+        # Never dump request URLs, tokens or authentication state in tracebacks.
+        log(f'Stopped on {type(e).__name__}. Progress retained; use --status to inspect pending sends.')
         sys.exit(1)

@@ -1,15 +1,45 @@
-# Telegram channel copier
+# Telegram channel transfer
 
-Configured job: source **-1003571991185**, destination **-1004455533802**, message IDs **4 through 56521 inclusive**. There are **56,518 ID slots**; deleted messages mean fewer actual posts.
+Copy or download/upload a chosen message range with album-aware progress and restart recovery.
 
-This copies existing messages using Telegram's `copyMessages` endpoint. There is no “Forwarded from” tag. Original captions are retained, and each album's available members in the requested range are submitted together. Photos, videos, audio, voice notes, documents, animations, stickers, text and other message types that Telegram permits copying are handled by Telegram itself. It does not download, recompress or upload your media.
+Default source: **-1003571991185**. Default destination: **-1004455533802**. Default range: **4–56521 inclusive** (56,518 ID slots, including holes).
 
-## Set up on Ubuntu / a VPS
+## Update your existing installation
 
-Requires Python 3.10 or newer. Extract this ZIP, then:
+Stop this copier with Ctrl+C first. The unrelated bot process on the other VPS can stay running.
 
 ```bash
-cd telegram_copier
+cd ~/frwd
+git pull --ff-only
+python3 -m pip install -r requirements.txt
+python3 copier.py
+```
+
+If you use a virtual environment, activate it before installing dependencies and running the script. Keep your existing `.env` and `state/` directory. SQLite is migrated without resetting progress. The existing failure on a protected source did not advance the checkpoint.
+
+Running `python3 copier.py` in a terminal now asks:
+
+```text
+First message link or ID [https://t.me/c/3571991185/4]:
+Last message link or ID [https://t.me/c/3571991185/56521]:
+```
+
+Paste the first and last links, or enter numeric IDs. Press Enter to accept the shown defaults. Both links must belong to the same source channel. The end is inclusive. Private-channel links and public-channel message links are supported; forum-topic links are not.
+
+If the source is protected, it then asks:
+
+```text
+Source has content protection enabled.
+Download and upload this range instead? [Y/n]:
+```
+
+Choose **Y**. The mode is saved for that job. This uses normal authenticated media downloads and fresh uploads; it does not change the source channel's settings. If Telegram refuses the bot's download, the transfer stops and retains progress. No transfer can guarantee that every protected source is downloadable.
+
+## First installation
+
+Python 3.10+ is required. Clone this repository or use GitHub's **Code → Download ZIP**. The bundled `telegram_copier.zip` is also updated with the source release.
+
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
@@ -17,7 +47,7 @@ cp .env.example .env
 nano .env
 ```
 
-Fill in all three values:
+Set:
 
 ```dotenv
 BOT_TOKEN=YOUR_BOT_TOKEN
@@ -25,133 +55,136 @@ API_ID=YOUR_NUMERIC_API_ID
 API_HASH=YOUR_API_HASH
 ```
 
-Get `API_ID` and `API_HASH` from https://my.telegram.org under **API development tools**. They are different from your bot token. The program logs in **as your bot**; it does not require a user-account session or your phone login code. Add the bot as administrator of both channels, with **Post Messages** enabled in the destination. Editing or deleting destination messages is not required.
+Obtain `API_ID` and `API_HASH` at https://my.telegram.org under **API development tools**. These are application credentials. The script logs in **as the bot**, without a user-account session or phone-code prompt. Add the bot as administrator of both channels; the destination requires **Post Messages** permission.
 
-Why the extra credentials? The HTTP Bot API can copy known IDs, but does not expose a general historical-message lookup to discover album boundaries. Telethon reads the specified IDs using `channels.getMessages`; the normal Bot API copies the resulting complete album units. No separate userbot is used.
+Do not share `.env`, the database, or another process's Telegram session. No bot token is embedded in the repository.
 
-Start:
+## Commands
 
-```bash
-python copier.py
-```
-
-It first scans metadata in batches of 100 IDs and saves each scan checkpoint. Only after scanning the range does it start copying. With the default one-second pause per metadata batch, scanning adds roughly ten minutes plus network time. Scan progress survives restarts.
-
-For a source-only inspection first:
+Interactive range selection and automatic mode prompt:
 
 ```bash
-python copier.py --scan-only
+python3 copier.py
 ```
 
-The inspection validates destination permissions but does not post there.
-
-## Progress and restarting
-
-Check progress, including while the copier is running:
+Resume the last selected job without range prompts:
 
 ```bash
-python copier.py --status
+python3 copier.py --resume
 ```
 
-Stop gracefully with **Ctrl+C**, then restart with the same command:
+Explicit download/upload job, suitable for a noninteractive terminal:
 
 ```bash
-python copier.py
+python3 copier.py \
+  --from https://t.me/c/3571991185/4 \
+  --to https://t.me/c/3571991185/56521 \
+  --destination -1004455533802 \
+  --mode upload
 ```
 
-The `state/` folder, beside the script, contains:
+Progress, including while the writer is running:
 
-| File | Purpose |
+```bash
+python3 copier.py --status
+```
+
+Other options:
+
+| Option | Meaning |
 |---|---|
-| `progress.sqlite3` | Authoritative scan, copy-operation journal, counters and cooldown |
-| `msg.txt` | Readable JSON checkpoint, next ID, remaining IDs and pending-send details |
-| `bot.session` | Telethon bot login session |
-| `copier.lock` | Prevents two copiers using the same state directory |
+| `--mode ask` | Default. Use copying normally; offer upload when protection is found. Remember a previously selected upload mode. |
+| `--mode copy` | Require server-side copying; stop if protection is detected. |
+| `--mode upload` | Download/upload from the beginning, even for an unprotected source. |
+| `--scan-only` | Inspect message IDs and albums without posting destination messages. |
+| `--seconds-per-message 5` | Slow final posting down to five seconds per message. |
+| `--state-dir /absolute/path` | Use one explicit job directory, bypassing automatic job selection. |
 
-Keep the entire state directory. Stop the program before taking a filesystem backup; retain any SQLite `-wal` / `-shm` sidecars that are present. The session file and `.env` contain secrets and should not be shared.
+`--resume`, `--status` and `--resolve` use a saved range. To select another range, use the regular prompts or `--from` and `--to`. A distinct range gets a distinct job directory; overlapping ranges can intentionally copy the same posts again.
 
-`last_processed_id` means the last source ID handled, including missing or skipped entries. For example, after copying 4 and discovering that 5 is absent, it records 5 and then copies 6. It never moves backwards to retry a deleted ID.
+## Media and album preservation
 
-`remaining_id_slots` is `56521 - last_processed_id`. After scanning finishes, `remaining_scanned_by_kind.copy` estimates the actual messages still queued. It is a snapshot: later source deletions or changes can affect delivery. `copied_messages` counts confirmed destination messages, not scan attempts or albums. A ten-item album counts as ten messages.
+The script scans the specified IDs before posting, saving each 100-ID scan checkpoint. It groups album members across scan-batch boundaries. If 5 is absent, it processes 4, records the missing 5, and proceeds to 6.
 
-SQLite takes precedence over `msg.txt`. If SQLite is unavailable but a valid `msg.txt` remains, a fresh database resumes after its checkpoint and rescans the remaining range. This loses the old per-operation audit history. An unresolved send recorded in `msg.txt` requires restoring SQLite first. **Do not edit the checkpoint to a larger ID**: that would omit messages. A smaller ID can cause duplicates or split an album.
+In upload mode it:
 
-## Rate limits and speed
+1. Fetches the current source messages for one album or standalone post.
+2. Downloads the media to a temporary directory.
+3. Carries over original caption text and formatting entities, per-item spoiler flags, document MIME type and attributes (including video dimensions/duration/streaming flags, audio information and original filename).
+4. Downloads the largest available regular source thumbnail and an explicit video cover, when present. A valid source thumbnail JPEG is kept unchanged; oversized or non-JPEG thumbnails are normalized for Telegram. If no regular thumbnail exists, it logs that limitation and Telegram may generate a preview. Telegram ultimately controls thumbnail rendering.
+5. Registers uploaded media objects, then sends the album in **one SendMultiMedia request**. This registration step creates no destination posts. Standalone items remain standalone.
+6. Commits confirmed destination IDs, then removes temporary files.
 
-Telegram's official bot FAQ says to avoid more than one message per second in a single chat, gives 20 messages per minute for a group, and about 30 messages per second for ordinary bulk broadcasts. The broadcast allowance is not a 30-message-per-second allowance for one destination. Telegram does not publish a universally safe archive-copy speed or a separate guaranteed album quota.
+Photo/video albums and file/audio albums are kept together. More than ten upload-album items, an interleaved source album, changed album membership or inconsistent caption placement causes a stop rather than silently splitting or reordering the posts. Only album members within the selected range are included; choose full-album boundaries when entering your links.
 
-The script's default **3 seconds per message** is a conservative engineering choice, not a guarantee. A ten-item album is copied in one request, then incurs a 30-second pause. Every destination message counts toward pacing. If other programs use the same bot, their traffic also matters.
+Text, photos, videos, documents, audio, voice/video notes and common sticker/animation files are supported. Contacts and static locations/venues are reconstructed. Special messages that cannot be faithfully reuploaded (for example dice, poll results, paid media, expiring media and live photos) stop the upload fallback for review. Copy mode supports whatever Telegram's `copyMessages` permits.
 
-| Selected pace | Nominal single-message throughput | Pacing time for 56,518 actual messages |
-|---|---:|---:|
-| 3 seconds, default | 20/minute | 47.1 hours |
-| 2 seconds, more aggressive | 30/minute | 31.4 hours |
-| 5 seconds, slower | 12/minute | 78.5 hours |
+“As it is” means preserving transferable content and layout, not a complete channel backup: messages receive new IDs and dates. Views, reactions, comments, reply relationships and interactive bot buttons are not migrated. Web previews can be regenerated. Telegram may process uploaded photos, thumbnails or other metadata; byte-identical visual presentation is not guaranteed. No local video recompression is performed.
 
-These estimates exclude metadata scanning, HTTP request time, manual reviews and Telegram cooldowns. Missing IDs reduce copying work. Example for a slower run:
+## Coexistence with a bot on another VPS
 
-```bash
-python copier.py --seconds-per-message 5
-```
+This is a finite transfer program, not a Telegram update listener:
 
-On HTTP **429**, the program saves `retry_after` plus five seconds and **exits**, as requested. During the metadata scan, a Telethon **FLOOD_WAIT** also saves the wait and exits. It will refuse to resume before the saved deadline expires. Afterwards, run `python copier.py` again. Permission errors and other rejections also stop without pretending that the current messages were copied.
+- It does **not** call Bot API `getUpdates`, `setWebhook` or `deleteWebhook`.
+- It uses a fresh in-memory MTProto session for each invocation; it never reuses or modifies another process's `.session` file, nor the old `state/bot.session`.
+- Update delivery, catch-up, login-time difference fetching and the update dispatcher are disabled. The two internal hooks are tested against the pinned **Telethon 1.45.0**; do not casually remove the version pin.
+- A local kernel lock prevents two writers from using the same job database. Status is read-only and remains available while that job runs.
+- Upload files use a job-specific temporary directory and are cleaned up on ordinary completion/errors. A hard kill can leave a `transfers/unit-*` folder in that job; after stopping its copier, that leftover folder may be deleted.
 
-This program does not enable paid broadcasts, rotate tokens or try to evade spam restrictions. Slowing it down does not override protected-content or access restrictions.
+This avoids the usual polling/webhook and shared-session-key conflicts. **Telegram limits still apply across all uses of the same bot token.** A process on another VPS can cause this job to be rate-limited. Separate VPS jobs are not coordinated by the local lock: if both write to the same destination, posts can interleave or duplicate. Use a separate bot token for independent quotas, or coordinate the destination/job with the other operator. No program can promise zero Telegram or network errors.
 
-## Interrupted or partial sends
+## Progress, recovery and limits
 
-The Bot API has no client-supplied idempotency key for `copyMessages`. If Telegram accepts a copy but the connection drops before the reply arrives, automatically repeating the request could duplicate the posts. Therefore the operation is written to SQLite before sending and becomes unresolved until delivery is known. A crash during the send behaves the same way.
+Legacy installations keep using the matching `state/progress.sqlite3`. New ranges live under `state/jobs/<source>_<destination>_<start>_<end>/`. `state/active_job.json` remembers the current selection. Each job contains its authoritative `progress.sqlite3`, readable JSON `msg.txt`, and `copier.lock`.
 
-Run `--status`, inspect its `source_ids`, and check the destination manually. Then use one of these commands:
+`last_processed_id` includes copied IDs and missing/service entries. `remaining_id_slots` is the end ID minus that checkpoint; after scanning, `remaining_scanned_by_kind.copy` counts queued message candidates. `copied_messages` counts confirmed destination posts: a ten-item album counts as ten. The scan is a snapshot; source edits/deletions during migration can change the final count.
 
-**All items were copied:** provide their actual destination message IDs in source order:
+SQLite takes precedence over `msg.txt`. A valid text checkpoint can initialize a replacement database if the database is lost and no send is unresolved. Remaining IDs are rescanned; the old detailed audit trail is not recreated. Never manually advance the checkpoint to hide a failure. Preserve the whole state directory; stop the program before filesystem backups and keep any SQLite sidecars present.
 
-```bash
-python copier.py --resolve done --destination-ids 9001,9002,9003
-```
+The default pace is **three seconds per final destination message**, including each album item. A ten-item album incurs a 30-second pause after posting. If all 56,518 IDs exist, pacing alone is about 47.1 hours. Download/upload adds time and bandwidth: approximately each file's size downloaded and uploaded, plus thumbnails. Temporary free disk must accommodate the next album. Telegram's current per-file upload restrictions still apply; large files are uploaded using MTProto rather than the cloud Bot API's multipart-upload path.
 
-**None were copied:** allow a retry, then run normally:
+Telegram advises avoiding more than one message per second in one chat; its FAQ also lists 20/minute for groups and about 30/second for ordinary broadcasts. These are not a guarantee for this job. Other bot processes contribute traffic. **HTTP 429 or FLOOD_WAIT saves the cooldown plus five seconds and exits**. Run `--resume` after the saved deadline. The job does not automatically evade or retry through a flood restriction.
 
-```bash
-python copier.py --resolve retry
-python copier.py
-```
+## Uncertain sends
 
-Do not select retry when some or all posts already arrived. If an uncertain operation delivered only part of an album, restore a clean destination state for that operation before retrying, or investigate it manually. The script does not delete posts for you.
+The database journals each final send before issuing it. Upload operations also store their MTProto random IDs. If sending succeeds but the reply is lost, automatic retries could duplicate posts, so an unresolved operation blocks restart until reviewed. Download/staging failures occur before this journal point and can be retried normally. No automatic exactly-once guarantee is made for ambiguous sends.
 
-**Telegram explicitly returned a partial success:** it saved the returned destination IDs and stopped. If you accept the omitted items as skipped:
-
-```bash
-python copier.py --resolve accept-partial
-python copier.py
-```
-
-The audit records a partial result without inventing source-to-destination mappings for the omitted entries. There is no promise of automatic exactly-once delivery after an ambiguous network failure.
-
-## What “as it is” can preserve
-
-- Albums are grouped across metadata batch boundaries; holes in IDs do not split them. Album members outside the specified start/end range are deliberately excluded.
-- Existing media and captions are copied through Telegram; messages get new destination IDs and posting times. Original views, reactions, comments, reply relationships and interactive bot behavior are not migrated. Treat this as a content copier, not a complete channel backup.
-- Content protection is respected. An entirely protected source stops the job; individually protected posts are recorded as skipped. Deleted and service messages are also skipped.
-- Telegram excludes certain content from copying, such as paid media, giveaways and invoices; quiz polls have additional requirements. If Telegram omits a candidate during copying, the program saves a partial result and stops for review rather than silently claiming success.
-- The manifest is a scan snapshot, not a live synchronization service. Avoid editing or deleting the source during the migration. No messages after ID 56521 are copied.
-- This code includes no running bot listener or bot commands; it is a finite archival-copy job authenticated as a bot.
-
-## Verification
-
-Twelve offline tests cover missing IDs, albums crossing scan batches, persisted cooldowns, database/text recovery, uncertain sends, partial results, permission failures, metadata classification and token-safe HTTP errors:
+Inspect `--status` and the destination. If every item arrived, supply the actual destination IDs in source order:
 
 ```bash
-python -m unittest -v
+python3 copier.py --resolve done --destination-ids 9001,9002,9003
+python3 copier.py --resume
 ```
 
-Tested with Python 3.12 and Telethon 1.45.0. No live channel transfer was tested because credentials were not supplied.
+If none arrived:
 
-## Official references checked 12 September 2026
+```bash
+python3 copier.py --resolve retry
+python3 copier.py --resume
+```
 
-- Copy behavior, albums, limitations and batch size: https://core.telegram.org/bots/api#copymessages
-- Retry-after response parameter: https://core.telegram.org/bots/api#responseparameters
-- Published bot rate guidance: https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this
-- Metadata lookup, usable by bots: https://core.telegram.org/method/channels.getMessages
-- Bot access-hash handling: https://core.telegram.org/api/peers#access-hash
-- Telethon bot sign-in and API credentials: https://docs.telethon.dev/en/stable/basic/signing-in.html
+Do not authorize retry if some posts already arrived. Investigate or manually restore a clean destination for that operation first. The script never deletes your posts automatically.
+
+Only when the **Bot API explicitly returned a partial copy result**, you may accept omitted items as skipped:
+
+```bash
+python3 copier.py --resolve accept-partial
+python3 copier.py --resume
+```
+
+## Testing
+
+```bash
+python3 -m unittest -v
+```
+
+The offline tests cover existing checkpoint recovery, range prompts, protected-mode selection, album staging, original thumbnail selection/normalization, media attributes, ambiguous sends, flood handling, disk-session isolation and suppression of update synchronization. No live transfer is claimed without credentials and a source/destination test.
+
+References:
+
+- https://core.telegram.org/bots/api#copymessages
+- https://core.telegram.org/method/channels.getMessages
+- https://core.telegram.org/method/messages.sendMultiMedia
+- https://core.telegram.org/method/messages.uploadMedia
+- https://core.telegram.org/bots/faq#my-bot-is-hitting-limits-how-do-i-avoid-this
+- https://docs.telethon.dev/en/stable/modules/client.html
